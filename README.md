@@ -51,12 +51,27 @@ pip install numpy pandas scipy shapely lxml utm tqdm matplotlib omegaconf
 
 ## Quick Start
 
+Choose `segment_size` from the dataset frame rate and your desired clip length:
+
+```text
+segment_size = frame_rate × desired_seconds
+```
+
+Frame rates used by the supported datasets:
+- `HetroD`: `30 Hz`
+- `inD`: `25 Hz`
+- `INTERACTION`: `10 Hz`
+- `SinD`: `29.97 Hz`
+
+Example:
+- `HetroD` at `30 Hz` with `segment_size=273` gives `273 / 30 = 9.1` seconds per clip.
+
 Convert `HetroD` to `ScenarioNet`:
 
 ```bash
 python scenarionet-converter/hetrod_scene.py \
   --root_dir /path/to/HetroD-dataset-v1.1 \
-  --segment_size 276 \
+  --segment_size 273 \
   --output_dir /path/to/output
 ```
 
@@ -65,7 +80,7 @@ Convert `inD` to `ScenarioNet`:
 ```bash
 python scenarionet-converter/inD_scene.py \
   --root_dir /path/to/inD-dataset-v1.1 \
-  --segment_size 203 \
+  --segment_size 228 \
   --output_dir /path/to/output
 ```
 
@@ -74,7 +89,7 @@ Convert `INTERACTION` to `ScenarioNet`:
 ```bash
 python scenarionet-converter/interaction_scene.py \
   --root_dir /path/to/INTERACTION \
-  --segment_size 200 \
+  --segment_size 91 \
   --output_dir /path/to/output
 ```
 
@@ -83,7 +98,7 @@ Convert `SinD` to `ScenarioNet`:
 ```bash
 python scenarionet-converter/sind_scene.py \
   --root_dir /path/to/SinD \
-  --segment_size 243 \
+  --segment_size 273 \
   --output_dir /path/to/output
 ```
 
