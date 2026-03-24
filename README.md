@@ -1,65 +1,66 @@
-This repository provides tools for converting **drone-view traffic datasets** into formats suitable for **autonomous driving simulation**, **motion prediction** and **motion planning**.
-It supports multiple datasets and output formats, handling trajectory data, map features, and agent metadata seamlessly.
+# HetroD Tools
 
----
+Code for the ICRA 2026 paper  
+**HetroD: A High-Fidelity Drone Dataset and Benchmark for Autonomous Driving in Heterogeneous Traffic**
 
-## ✨ Features
+[Paper](https://arxiv.org/abs/2602.03447) | [Dataset](https://hetroddata.github.io/HetroD/)
 
-* **Multi-Dataset Support**: inD, INTERACTION, and SinD
+Yu-Hsiang Chen, Wei-Jer Chang, Christian Kotulla, Thomas Keutgens, Steffen Runde, Tobias Moers, Christoph Klas, Wei Zhan, Masayoshi Tomizuka, Yi-Ting Chen
 
-* **Multi-Format Output**:
+National Yang Ming Chiao Tung University, UC Berkeley, fka GmbH
 
-  * [ScenarioNet](https://github.com/metadriverse/scenarionet)
-  * [MetaDrive](https://github.com/metadriverse/metadrive)
-  * [VBD](https://github.com/SafeRoboticsLab/VBD)
-  * [Scenario Dreamer](https://github.com/princeton-computational-imaging/scenario-dreamer)
+## Overview
 
-* **Upcoming Support**:
+This repository provides compact tools for converting drone-view traffic datasets into formats used by autonomous driving simulation, motion prediction, and planning pipelines.
 
-  * [ScenarioMax](https://github.com/valeoai/V-Max/tree/main/vmax)
-  * [GPUDrive](https://github.com/Emerge-Lab/gpudrive)
-  * [trajdata](https://github.com/NVlabs/trajdata)
+Current support:
+- Drone datasets: `HetroD`, `inD`, `INTERACTION`, `SinD`
+- Output formats: [ScenarioNet](https://github.com/metadriverse/scenarionet), [VBD](https://github.com/SafeRoboticsLab/VBD), [Scenario Dreamer](https://github.com/princeton-computational-imaging/scenario-dreamer)
 
-* **Ego-Centric Alignment**: Automatic ego vehicle selection and coordinate transformation
+Core capabilities:
+- Ego-centric scenario alignment
+- Scenario segmentation from long recordings
+- Map and trajectory conversion into ScenarioNet-compatible format
 
-* **Segmentation**: Split long recordings into manageable scenario clips
+## Structure
 
----
-
-## 📂 Project Structure
-
-```
+```text
 drone-tool/
-├── scenarionet-converter/                  # Convert drone datasets to ScenarioNet format
+├── scenarionet-converter/
+│   ├── hetrod_scene.py
 │   ├── inD_scene.py
 │   ├── interaction_scene.py
 │   └── sind_scene.py
-├── scenarionet-VBD-converter/              # Convert ScenarioNet → VBD
+├── scenarionet-VBD-converter/
 │   └── convert_scenarionet_to_vbd.py
-└── scenarionet-scenariodreamer-converter/  # Convert ScenarioNet → Scenario Dreamer
+└── scenarionet-scenariodreamer-converter/
     └── scenarionet_to_scenariodreamer_waymo.py
 ```
 
----
+## Installation
 
+Please install the required ScenarioNet and MetaDrive environments first:
+- [ScenarioNet](https://github.com/metadriverse/scenarionet)
+- [MetaDrive](https://github.com/metadriverse/metadrive)
 
-
-## ⚙️ Installation
-
-Please follow the official **[ScenarioNet](https://github.com/metadriverse/scenarionet)** and **[MetaDrive](https://github.com/metadriverse/metadrive)** setup guides to install the required environment.
-Once their environments are properly configured, install the core dependencies:
+Then install the common Python dependencies:
 
 ```bash
 pip install numpy pandas scipy shapely lxml utm tqdm matplotlib omegaconf
 ```
 
----
+## Quick Start
 
+Convert `HetroD` to `ScenarioNet`:
 
+```bash
+python scenarionet-converter/hetrod_scene.py \
+  --root_dir /path/to/HetroD-dataset-v1.1 \
+  --segment_size 276 \
+  --output_dir /path/to/output
+```
 
-## 🚀 Usage
-
-### 1. Convert inD → ScenarioNet
+Convert `inD` to `ScenarioNet`:
 
 ```bash
 python scenarionet-converter/inD_scene.py \
@@ -68,15 +69,7 @@ python scenarionet-converter/inD_scene.py \
   --output_dir /path/to/output
 ```
 
-**Outputs:**
-
-* ScenarioNet pickle files (ego-aligned)
-* `dataset_summary.pkl`
-* `dataset_mapping.pkl`
-
----
-
-### 2. Convert INTERACTION → ScenarioNet
+Convert `INTERACTION` to `ScenarioNet`:
 
 ```bash
 python scenarionet-converter/interaction_scene.py \
@@ -85,9 +78,7 @@ python scenarionet-converter/interaction_scene.py \
   --output_dir /path/to/output
 ```
 
----
-
-### 3. Convert SinD → ScenarioNet
+Convert `SinD` to `ScenarioNet`:
 
 ```bash
 python scenarionet-converter/sind_scene.py \
@@ -96,10 +87,7 @@ python scenarionet-converter/sind_scene.py \
   --output_dir /path/to/output
 ```
 
-
----
-
-### 4. Convert ScenarioNet → VBD
+Convert `ScenarioNet` to `VBD`:
 
 ```bash
 python scenarionet-VBD-converter/convert_scenarionet_to_vbd.py \
@@ -109,11 +97,7 @@ python scenarionet-VBD-converter/convert_scenarionet_to_vbd.py \
   --include_raw
 ```
 
----
-
-### 5. Convert ScenarioNet → Scenario Dreamer
-
-(Place the script inside Scenario Dreamer’s `scripts/` directory before running.)
+Convert `ScenarioNet` to `Scenario Dreamer`:
 
 ```bash
 python scenarionet-scenariodreamer-converter/scenarionet_to_scenariodreamer_waymo.py \
@@ -126,8 +110,22 @@ python scenarionet-scenariodreamer-converter/scenarionet_to_scenariodreamer_waym
   --seed 0
 ```
 
----
+Place this script inside Scenario Dreamer's `scripts/` directory before running.
 
-## 📚 Citation
+## Output
 
-If you use this toolkit, please cite the corresponding datasets and their maintainers.
+ScenarioNet conversion produces:
+- Scenario `.pkl` files
+- `dataset_summary.pkl`
+- `dataset_mapping.pkl`
+
+## Citation
+
+```bibtex
+@inproceedings{hetrod,
+  title={HetroD: A High-Fidelity Drone Dataset and Benchmark for Autonomous Driving in Heterogeneous Traffic},
+  author={Yu-Hsiang Chen and Wei-Jer Chang and Christian Kotulla and Thomas Keutgens and Steffen Runde and Tobias Moers and Christoph Klas and Wei Zhan and Masayoshi Tomizuka and Yi-Ting Chen},
+  booktitle={Proceedings of the IEEE International Conference on Robotics and Automation (ICRA)},
+  year={2026}
+}
+```
