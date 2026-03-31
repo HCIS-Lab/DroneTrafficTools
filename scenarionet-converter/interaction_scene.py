@@ -57,6 +57,46 @@ AGENT_TYPE_MAPPING = {
     "bicycle": MetaDriveType.PEDESTRIAN,  # treat bicycle like pedestrian here
 }
 
+WAYMO_DT = 0.1
+WAYMO_SCENARIO_LENGTH = 91
+WAYMO_CURRENT_TIME_INDEX = 10
+
+
+def compute_waymo_frame_offsets(frame_rate, target_dt=WAYMO_DT, scenario_length=WAYMO_SCENARIO_LENGTH):
+    offsets = [int(round(i * target_dt * frame_rate)) for i in range(scenario_length)]
+    if len(set(offsets)) != len(offsets):
+        raise ValueError(f"frame_rate={frame_rate} is too low to sample unique {scenario_length} steps at dt={target_dt}")
+    return offsets
+
+
+def split_rows_into_waymo_segments(rows, frame_rate, scenario_length=WAYMO_SCENARIO_LENGTH, target_dt=WAYMO_DT):
+    if not rows:
+        return []
+    frame_offsets = compute_waymo_frame_offsets(frame_rate, target_dt=target_dt, scenario_length=scenario_length)
+    raw_window = frame_offsets[-1] + 1
+    min_frame = min(r["frame_number"] for r in rows)
+    max_frame = max(r["frame_number"] for r in rows)
+    segments = []
+    start_frame = min_frame
+    while start_frame + raw_window - 1 <= max_frame:
+        sampled_frames = [start_frame + offset for offset in frame_offsets]
+        sampled_set = set(sampled_frames)
+        seg_rows = [r for r in rows if r["frame_number"] in sampled_set]
+        if seg_rows:
+            segments.append({"rows": seg_rows, "frames": sampled_frames})
+        start_frame += raw_window
+    return segments
+
+
+def infer_interaction_frame_rate(csv_path: str) -> float:
+    df = pd.read_csv(csv_path, usecols=["timestamp_ms"], nrows=8)
+    if len(df) < 2:
+        return 10.0
+    delta_ms = float(df["timestamp_ms"].iloc[1] - df["timestamp_ms"].iloc[0])
+    if delta_ms <= 0:
+        return 10.0
+    return 1000.0 / delta_ms
+
 
 def map_osm_to_md_type(osm_type: str, subtype: str = None):
     """Comprehensive mapping OSM → MetaDrive type for INTERACTION dataset."""
@@ -370,16 +410,18 @@ def parse_osm_generic(osm_path: str):
         lid = str(rel["id"])
         map_features[lid] = {
             "type": MetaDriveType.LANE_SURFACE_STREET,
-            "polyline": center,
-            "polygon": np.asarray(lane_poly.exterior.coords),
-            "left_boundary": l_res,
-            "right_boundary": r_res,
+            "polyline": center.astype(np.float32),
             "entry_lanes": [],
             "exit_lanes": [],
             "left_neighbor": [],
             "right_neighbor": [],
-            "speed_limit_kmh": [50],
-            "metadata": rel["tags"],
+            "speed_limit_kmh": 50.0,
+            "interpolating": True,
+            "width": np.zeros((len(center), 2), dtype=np.float32),
+            "_left_boundary_coords": l_res.astype(np.float32),
+            "_right_boundary_coords": r_res.astype(np.float32),
+            "_left_boundary_ids": [str(w) for w in left_ids],
+            "_right_boundary_ids": [str(w) for w in right_ids],
         }
         lane_boundary_refs[lid] = {
             "left": left_ids,
@@ -420,8 +462,8 @@ def parse_osm_generic(osm_path: str):
     for lane_id, feat in map_features.items():
         if feat.get("type") != MetaDriveType.LANE_SURFACE_STREET:
             continue
-        feat["left_neighbor"] = sorted(left_neighbor_sets.get(lane_id, []), key=str)
-        feat["right_neighbor"] = sorted(right_neighbor_sets.get(lane_id, []), key=str)
+        feat["_left_neighbor_ids"] = sorted(left_neighbor_sets.get(lane_id, []), key=str)
+        feat["_right_neighbor_ids"] = sorted(right_neighbor_sets.get(lane_id, []), key=str)
 
     # 6) quick connectivity pass (same as inD)
     lane_endpoints = {}
@@ -493,7 +535,7 @@ def create_scenario_from_csv(
     map_center: Tuple[float, float],
     scenario_id: str,
     dataset_version: str,
-    sample_rate: float = 0.1,
+    sampled_frames: List[int],
 ):
     """Convert raw per-frame rows → ScenarioDescription variants (ego aligned)."""
 
@@ -501,25 +543,78 @@ def create_scenario_from_csv(
     scenario[SD.ID] = scenario_id
     scenario[SD.VERSION] = dataset_version
     scenario[SD.METADATA] = {
-        SD.COORDINATE: "right-handed",
+        SD.COORDINATE: "metadrive",
         "dataset": "INTERACTION",
         "scenario_id": scenario_id,
         "metadrive_processed": False,
-        "map": f"{scenario_id.split('_')[0]}.osm_xy",  # original lanelet file name
-        "date": "2025-01-01",  # placeholder
-        "sample_rate": sample_rate,
+        "id": scenario_id,
     }
-
-    scenario[SD.MAP_FEATURES] = map_features
-
-    frames = sorted({int(r["frame_number"]) for r in scenario_rows})
+    scenario_map = copy.deepcopy(map_features)
+    frames = list(sampled_frames)
     num_frames = len(frames)
     scenario[SD.LENGTH] = num_frames
-
-    timestep_arr = np.linspace(0, (num_frames - 1) * sample_rate, num_frames)
+    timestep_arr = np.arange(num_frames, dtype=np.float32) * np.float32(WAYMO_DT)
     scenario[SD.METADATA][SD.TIMESTEP] = timestep_arr
-    scenario[SD.TIMESTEP] = timestep_arr
+    scenario[SD.METADATA]["ts"] = timestep_arr
     frame_to_idx = {f: i for i, f in enumerate(frames)}
+
+    def build_boundary_descriptors(boundary_ids, lane_end_index):
+        return [{
+            "lane_start_index": "0",
+            "lane_end_index": str(lane_end_index),
+            "boundary_type": str(scenario_map.get(boundary_id, {}).get("type", "UNKNOWN")),
+            "boundary_feature_id": str(boundary_id),
+        } for boundary_id in boundary_ids]
+
+    lane_boundary_refs = {}
+    left_neighbor_sets = defaultdict(set)
+    right_neighbor_sets = defaultdict(set)
+    for feat_id, feat in scenario_map.items():
+        if feat.get("type") != MetaDriveType.LANE_SURFACE_STREET or "polyline" not in feat:
+            continue
+        lane_boundary_refs[feat_id] = {
+            "left": list(feat.pop("_left_boundary_ids", [])),
+            "right": list(feat.pop("_right_boundary_ids", [])),
+        }
+        left_neighbor_sets[feat_id].update(feat.pop("_left_neighbor_ids", []))
+        right_neighbor_sets[feat_id].update(feat.pop("_right_neighbor_ids", []))
+        polyline = feat["polyline"]
+        if polyline.shape[-1] == 2:
+            polyline = np.concatenate([polyline.astype(np.float32), np.zeros((polyline.shape[0], 1), dtype=np.float32)], axis=1)
+            feat["polyline"] = polyline
+        lane_end_index = len(polyline) - 1
+        feat["left_boundaries"] = build_boundary_descriptors(lane_boundary_refs[feat_id]["left"], lane_end_index)
+        feat["right_boundaries"] = build_boundary_descriptors(lane_boundary_refs[feat_id]["right"], lane_end_index)
+        feat["left_neighbor"] = [{
+            "feature_id": str(nid),
+            "self_start_index": "0",
+            "self_end_index": str(lane_end_index),
+            "neighbor_start_index": "0",
+            "neighbor_end_index": str(len(scenario_map[nid]["polyline"]) - 1),
+            "boundaries": [{"lane_start_index": "0", "lane_end_index": str(lane_end_index), "boundary_type": "UNKNOWN", "boundary_feature_id": "0"}],
+        } for nid in sorted(left_neighbor_sets[feat_id], key=str) if nid in scenario_map and "polyline" in scenario_map[nid]]
+        feat["right_neighbor"] = [{
+            "feature_id": str(nid),
+            "self_start_index": "0",
+            "self_end_index": str(lane_end_index),
+            "neighbor_start_index": "0",
+            "neighbor_end_index": str(len(scenario_map[nid]["polyline"]) - 1),
+            "boundaries": [{"lane_start_index": "0", "lane_end_index": str(lane_end_index), "boundary_type": "UNKNOWN", "boundary_feature_id": "0"}],
+        } for nid in sorted(right_neighbor_sets[feat_id], key=str) if nid in scenario_map and "polyline" in scenario_map[nid]]
+        left_boundary = feat.pop("_left_boundary_coords", None)
+        right_boundary = feat.pop("_right_boundary_coords", None)
+        center_xy = polyline[:, :2]
+        left_width = np.zeros(len(polyline), dtype=np.float32)
+        right_width = np.zeros(len(polyline), dtype=np.float32)
+        if isinstance(left_boundary, np.ndarray) and left_boundary.shape[0] == len(polyline):
+            left_width = np.linalg.norm(center_xy - left_boundary[:, :2], axis=1).astype(np.float32)
+        if isinstance(right_boundary, np.ndarray) and right_boundary.shape[0] == len(polyline):
+            right_width = np.linalg.norm(right_boundary[:, :2] - center_xy, axis=1).astype(np.float32)
+        feat["width"] = np.stack([left_width, right_width], axis=1).astype(np.float32)
+        feat["speed_limit_kmh"] = float(feat.get("speed_limit_kmh", 0.0))
+        feat["speed_limit_mph"] = float(feat["speed_limit_kmh"] / 1.60934)
+
+    scenario[SD.MAP_FEATURES] = scenario_map
 
     # group by agent
     per_agent: Dict[str, List[Row]] = defaultdict(list)
@@ -534,13 +629,13 @@ def create_scenario_from_csv(
 
     for aid, recs in per_agent.items():
         recs.sort(key=lambda x: int(x["frame_number"]))
-        positions = np.zeros((num_frames, 3))
-        headings = np.zeros(num_frames)
-        velocities = np.zeros((num_frames, 2))
-        lengths = np.zeros((num_frames, 1))
-        widths = np.zeros((num_frames, 1))
-        heights = np.zeros((num_frames, 1))
-        valid = np.zeros(num_frames)
+        positions = np.zeros((num_frames, 3), dtype=np.float32)
+        headings = np.zeros(num_frames, dtype=np.float32)
+        velocities = np.zeros((num_frames, 2), dtype=np.float32)
+        lengths = np.zeros(num_frames, dtype=np.float32)
+        widths = np.zeros(num_frames, dtype=np.float32)
+        heights = np.zeros(num_frames, dtype=np.float32)
+        valid = np.zeros(num_frames, dtype=bool)
 
         for rec in recs:
             idx = frame_to_idx[int(rec["frame_number"])]
@@ -549,10 +644,10 @@ def create_scenario_from_csv(
             headings[idx] = rec["psi_rad_rad"]
             velocities[idx, 0] = rec["vx_m_s"]
             velocities[idx, 1] = rec["vy_m_s"]
-            lengths[idx, 0] = rec["avg_height_m"]
-            widths[idx, 0] = rec["avg_width_m"]
-            heights[idx, 0] = 1.5
-            valid[idx] = 1
+            lengths[idx] = rec["avg_height_m"]
+            widths[idx] = rec["avg_width_m"]
+            heights[idx] = 1.5
+            valid[idx] = True
 
         raw_type = agent_types[aid]
         agent_type = AGENT_TYPE_MAPPING.get(raw_type, MetaDriveType.OTHER)
@@ -561,22 +656,15 @@ def create_scenario_from_csv(
         valid_pos = positions[valid > 0][:, :2]
         dist = float(np.sum(np.linalg.norm(np.diff(valid_pos, axis=0), axis=1))) if len(valid_pos) >= 2 else 0.0
 
-        # heading change
-        valid_idx = np.where(valid > 0)[0]
-        heading_change = float(np.sum(np.abs(np.diff(headings[valid_idx])))) if len(valid_idx) >= 2 else 0.0
-
-        challenge_score = dist + heading_change
         vlen = int(np.sum(valid))
         cval_len = compute_continuous_valid_length(valid)
 
         object_summary[aid] = {
-            "type": agent_type,
+            "type": str(agent_type),
             "valid_length": vlen,
             "continuous_valid_length": cval_len,
             "track_length": num_frames,
             "moving_distance": dist,
-            "total_heading_change": heading_change,
-            "challenge_score": challenge_score,
             "object_id": aid,
         }
 
@@ -592,9 +680,10 @@ def create_scenario_from_csv(
                 "valid": valid,
             },
             SD.METADATA: {
-                "track_length": vlen,
-                "type": agent_type,
+                "track_length": num_frames,
+                "type": str(agent_type),
                 SD.OBJECT_ID: aid,
+                "dataset": "INTERACTION",
                 "original_id": aid,
             },
         }
@@ -611,8 +700,8 @@ def create_scenario_from_csv(
         "num_traffic_lights": 0,
         "num_traffic_light_types": set(),
         "num_traffic_light_each_step": {},
-        "num_map_features": len(map_features),
-        "map_height_diff": float("-inf"),
+        "num_map_features": len(scenario_map),
+        "map_height_diff": 0.0,
     }
 
     for aid in scenario[SD.TRACKS].keys():
@@ -626,21 +715,23 @@ def create_scenario_from_csv(
     scenario[SD.METADATA]["number_summary"] = num_summary
 
     # choose ego – longest continuous presence
-    ego_id = max(object_summary, key=lambda k: object_summary[k]["continuous_valid_length"])
+    eligible_sdc_ids = [aid for aid, track in scenario[SD.TRACKS].items() if track[SD.STATE]["valid"][WAYMO_CURRENT_TIME_INDEX]]
+    ego_id = max(eligible_sdc_ids if eligible_sdc_ids else object_summary, key=lambda k: object_summary[k]["continuous_valid_length"])
+    scenario[SD.METADATA]["current_time_index"] = WAYMO_CURRENT_TIME_INDEX
+    scenario[SD.METADATA]["sdc_track_index"] = list(scenario[SD.TRACKS].keys()).index(ego_id)
+    scenario[SD.METADATA]["objects_of_interest"] = []
+    scenario[SD.METADATA]["source_file"] = scenario_id
+    scenario[SD.METADATA]["track_length"] = num_frames
     scenario_variants = []
-    for idx, aid in enumerate([ego_id], 1):  # just 1 variant
+    for idx, aid in enumerate([ego_id], 1):
         sc = copy.deepcopy(scenario)
-        if aid != "ego":
-            sc[SD.TRACKS]["ego"] = sc[SD.TRACKS].pop(aid)
-            sc[SD.TRACKS]["ego"][SD.METADATA][SD.OBJECT_ID] = "ego"
-            sc[SD.TRACKS]["ego"][SD.METADATA]["original_id"] = aid
-        sc[SD.METADATA][SD.SDC_ID] = "ego"
+        sc[SD.METADATA][SD.SDC_ID] = aid
         sc[SD.METADATA]["tracks_to_predict"] = {
-            "ego": {
-                "track_id": "ego",
-                "object_type": sc[SD.TRACKS]["ego"][SD.TYPE],
+            aid: {
+                "track_id": aid,
+                "object_type": sc[SD.TRACKS][aid][SD.TYPE],
                 "difficulty": 0,
-                "track_index": list(sc[SD.TRACKS].keys()).index("ego"),
+                "track_index": list(sc[SD.TRACKS].keys()).index(aid),
             }
         }
         sc[SD.DYNAMIC_MAP_STATES] = {}
@@ -648,7 +739,8 @@ def create_scenario_from_csv(
 
     # ego-centric transform per variant
     for sc in scenario_variants:
-        ego_state = sc[SD.TRACKS]["ego"][SD.STATE]
+        sdc_id = sc[SD.METADATA][SD.SDC_ID]
+        ego_state = sc[SD.TRACKS][sdc_id][SD.STATE]
         first_valid = int(np.where(ego_state["valid"] > 0)[0][0])
         origin_xy = ego_state["position"][first_valid, :2].copy()
         psi0 = float(ego_state["heading"][first_valid])
@@ -657,10 +749,13 @@ def create_scenario_from_csv(
 
         # shift + rotate map
         for feat in sc[SD.MAP_FEATURES].values():
-            for key in ("polyline", "polygon", "left_boundary", "right_boundary"):
-                if key in feat:
-                    pts = feat[key] - origin_xy
-                    feat[key] = (R @ pts.T).T
+            for key in ("polyline", "polygon"):
+                if key in feat and isinstance(feat[key], np.ndarray):
+                    pts = feat[key].copy()
+                    if pts.shape[-1] >= 2:
+                        pts[:, :2] -= origin_xy
+                        pts[:, :2] = (R @ pts[:, :2].T).T
+                        feat[key] = pts
 
         # shift + rotate all agents
         for tr in sc[SD.TRACKS].values():
@@ -670,7 +765,7 @@ def create_scenario_from_csv(
             P[:, :2] = (R @ P[:, :2].T).T
             V[:] = (R @ V.T).T
             tr[SD.STATE]["position"] = P
-            tr[SD.STATE]["velocity"] = V
+            tr[SD.STATE]["velocity"] = V.astype(np.float32)
             tr[SD.STATE]["heading"] -= psi0
 
     return scenario_variants
@@ -684,7 +779,7 @@ def create_scenario_from_csv(
 def main():
     ap = argparse.ArgumentParser("Convert INTERACTION dataset folder into ScenarioNet pickles")
     ap.add_argument("--root_dir", required=True, help="Path to INTERACTION root containing 'data' & 'maps' sub-folders")
-    ap.add_argument("--segment_size", type=int, default=200, help="Optional: split each scenario every N frames (0 = no split)")
+    ap.add_argument("--segment_size", type=int, default=91, help="Raw frames per scenario window. Default 91 frames = 9.0s at 10Hz.")
     ap.add_argument("--output_dir", default=None, help="Where to save .pkl scenarios (default: <root_dir>/converted_scenarios)")
     args = ap.parse_args()
 
@@ -724,24 +819,18 @@ def main():
             if not rows:
                 continue
 
-            # optional segmentation
-            def split_rows(rows_, size):
-                if size <= 0:
-                    return [rows_]
-                min_frame = min(r["frame_number"] for r in rows_)
-                max_frame = max(r["frame_number"] for r in rows_)
-                num_segs = math.ceil((max_frame - min_frame + 1) / size)
-                segs = [[] for _ in range(num_segs)]
-                for r in rows_:
-                    idx = (r["frame_number"] - min_frame) // size
-                    segs[idx].append(r)
-                return [s for s in segs if s]
-
-            segments = split_rows(rows, segment_size)
+            frame_rate = infer_interaction_frame_rate(csv_path)
+            expected_raw_window = compute_waymo_frame_offsets(frame_rate)[-1] + 1
+            if segment_size != expected_raw_window:
+                print(
+                    f"  [WARN] segment_size={segment_size} is ignored for Waymo alignment; "
+                    f"using raw_window={expected_raw_window} from frame_rate={frame_rate}"
+                )
+            segments = split_rows_into_waymo_segments(rows, frame_rate)
             base_id = os.path.splitext(csv_file)[0]  # e.g. vehicle_tracks_000
-            for seg_idx, seg_rows in enumerate(segments, 1):
+            for seg_idx, seg in enumerate(segments, 1):
                 sc_id = f"{scenario_name}_{base_id}_seg{seg_idx}"
-                variant_list = create_scenario_from_csv(seg_rows, map_features, map_center, sc_id, dataset_version)
+                variant_list = create_scenario_from_csv(seg["rows"], map_features, map_center, sc_id, dataset_version, seg["frames"])
                 for v in variant_list:
                     v_id = f"{sc_id}_ego"
                     v[SD.ID] = v_id

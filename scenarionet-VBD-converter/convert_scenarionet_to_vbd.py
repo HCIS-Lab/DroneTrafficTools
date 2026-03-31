@@ -11,6 +11,7 @@ import glob
 import math
 import os
 import pickle
+from typing import Optional
 
 import numpy as np
 from tqdm import tqdm
@@ -109,8 +110,8 @@ MAX_OBJECTS = 64
 MAX_POLYLINES = 256
 NUM_POINTS_POLYLINE = 30
 MAX_TRAFFIC_LIGHTS = 16
-TARGET_FRAME_RATE = 10.0  # Hz we expect after resampling
-DEFAULT_FRAME_RATE = 30.0
+TARGET_FRAME_RATE = 10.0
+DEFAULT_FRAME_RATE = 10.0
 
 TYPE_TO_ID = {
     'VEHICLE': 1,
@@ -214,6 +215,19 @@ def _downsample_array(arr, stride: int):
     if stride <= 1:
         return arr
     return arr[::stride]
+
+
+def infer_frame_rate(scenario, fallback: float = DEFAULT_FRAME_RATE) -> float:
+    ts = scenario.get('metadata', {}).get('ts')
+    if ts is None:
+        ts = scenario.get('metadata', {}).get('timestep')
+    if ts is not None:
+        ts = np.asarray(ts, dtype=np.float32)
+        if ts.size >= 2:
+            dt = float(ts[1] - ts[0])
+            if dt > 1e-6:
+                return 1.0 / dt
+    return float(fallback)
 
 
 def process_trajectories(scenario, frame_rate: float = DEFAULT_FRAME_RATE):
@@ -324,7 +338,9 @@ def process_trajectories(scenario, frame_rate: float = DEFAULT_FRAME_RATE):
     return agents_history, agents_future, agents_interested, agents_type, agents_id
 
 
-def scenarionet_to_vbd(scenario, include_raw=False, frame_rate: float = DEFAULT_FRAME_RATE):
+def scenarionet_to_vbd(scenario, include_raw=False, frame_rate: Optional[float] = None):
+    if frame_rate is None:
+        frame_rate = infer_frame_rate(scenario, DEFAULT_FRAME_RATE)
     agents_history, agents_future, agents_interested, agents_type, agents_id = process_trajectories(
         scenario, frame_rate=frame_rate
     )
@@ -348,7 +364,7 @@ def scenarionet_to_vbd(scenario, include_raw=False, frame_rate: float = DEFAULT_
     return data_dict
 
 
-def convert_directory(input_dir, output_dir, include_raw=False, frame_rate: float = DEFAULT_FRAME_RATE):
+def convert_directory(input_dir, output_dir, include_raw=False, frame_rate: Optional[float] = None):
     os.makedirs(output_dir, exist_ok=True)
     pkl_files = sorted(glob.glob(os.path.join(input_dir, '*.pkl')))
     if len(pkl_files) == 0:
@@ -374,7 +390,7 @@ def parse_args():
     parser.add_argument('--input_dir', type=str, required=True, help='Directory containing ScenarioNet PKL files.')
     parser.add_argument('--output_dir', type=str, required=True, help='Directory to save converted VBD pickles.')
     parser.add_argument('--include_raw', action='store_true', help='Store original ScenarioNet scenario inside output.')
-    parser.add_argument('--frame_rate', type=float, default=DEFAULT_FRAME_RATE, help='Source data frame rate (Hz).')
+    parser.add_argument('--frame_rate', type=float, default=None, help='Optional source frame rate override; default infers from scenario metadata ts.')
     return parser.parse_args()
 
 
