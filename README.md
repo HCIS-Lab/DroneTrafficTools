@@ -51,27 +51,25 @@ pip install numpy pandas scipy shapely lxml utm tqdm matplotlib omegaconf
 
 ## Quick Start
 
-Choose `segment_size` from the dataset frame rate and your desired clip length:
+The ScenarioNet converters now normalize all supported datasets to a Waymo-like scenario layout:
+- `91` timesteps
+- `10 Hz`
+- `ts = 0.0 ... 9.0`
+- `current_time_index = 10`
 
-```text
-segment_size = frame_rate × desired_seconds
-```
-
-Frame rates used by the supported datasets:
+Source frame rates used internally:
 - `HetroD`: `30 Hz`
 - `inD`: `25 Hz`
 - `INTERACTION`: `10 Hz`
 - `SinD`: `29.97 Hz`
 
-Example:
-- `HetroD` at `30 Hz` with `segment_size=273` gives `273 / 30 = 9.1` seconds per clip.
+The converters compute the correct raw window from the dataset frame rate automatically. You usually do not need to pass `--segment_size`; if you do, it is ignored when Waymo alignment is enabled.
 
 Convert `HetroD` to `ScenarioNet`:
 
 ```bash
 python scenarionet-converter/hetrod_scene.py \
   --root_dir /path/to/HetroD-dataset-v1.1 \
-  --segment_size 273 \
   --output_dir /path/to/output
 ```
 
@@ -80,7 +78,6 @@ Convert `inD` to `ScenarioNet`:
 ```bash
 python scenarionet-converter/inD_scene.py \
   --root_dir /path/to/inD-dataset-v1.1 \
-  --segment_size 228 \
   --output_dir /path/to/output
 ```
 
@@ -89,7 +86,6 @@ Convert `INTERACTION` to `ScenarioNet`:
 ```bash
 python scenarionet-converter/interaction_scene.py \
   --root_dir /path/to/INTERACTION \
-  --segment_size 91 \
   --output_dir /path/to/output
 ```
 
@@ -98,7 +94,6 @@ Convert `SinD` to `ScenarioNet`:
 ```bash
 python scenarionet-converter/sind_scene.py \
   --root_dir /path/to/SinD \
-  --segment_size 273 \
   --output_dir /path/to/output
 ```
 
@@ -108,9 +103,12 @@ Convert `ScenarioNet` to `VBD`:
 python scenarionet-VBD-converter/convert_scenarionet_to_vbd.py \
   --input_dir /path/to/scenarionet \
   --output_dir /path/to/vbd \
-  --frame_rate 30.0 \
   --include_raw
 ```
+
+Notes:
+- `convert_scenarionet_to_vbd.py` now infers frame rate from `metadata["ts"]` by default.
+- Only pass `--frame_rate` if you explicitly want to override the inferred value.
 
 Convert `ScenarioNet` to `Scenario Dreamer`:
 
@@ -127,12 +125,26 @@ python scenarionet-scenariodreamer-converter/scenarionet_to_scenariodreamer_waym
 
 Place this script inside Scenario Dreamer's `scripts/` directory before running.
 
+Notes:
+- The Scenario Dreamer converter now expects ScenarioNet inputs that are already normalized to `10 Hz / 91` steps.
+- It uses `metadata["sdc_id"]` instead of assuming the SDC track is renamed to `"ego"`.
+
 ## Output
 
 ScenarioNet conversion produces:
 - Scenario `.pkl` files
 - `dataset_summary.pkl`
 - `dataset_mapping.pkl`
+
+The generated ScenarioNet files are aligned to the official Waymo ScenarioNet schema at the format level:
+- top-level keys match Waymo samples
+- metadata keys match Waymo samples
+- track state array shapes and dtypes match Waymo samples
+- lane features use Waymo-style `left_boundaries`, `right_boundaries`, `left_neighbor`, `right_neighbor`, `width`, `speed_limit_kmh`, and `speed_limit_mph`
+
+Known remaining semantic differences from raw Waymo data:
+- `dynamic_map_states` is empty unless the source dataset provides traffic light state
+- lane boundary / neighbor intervals are simplified compared with Waymo's finer-grained chunked lane semantics
 
 ## Citation
 
