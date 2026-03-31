@@ -9,6 +9,7 @@ import pickle
 import shutil
 import copy
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
 
 from numpy.linalg import norm
@@ -239,26 +240,26 @@ def split_into_segments(rows, segment_size):
     return [seg for seg in segments if seg]
 
 
-def compute_raw_window_and_stride(frame_rate, target_dt=WAYMO_DT, scenario_length=WAYMO_SCENARIO_LENGTH):
-    raw_stride = int(round(frame_rate * target_dt))
-    if not np.isclose(raw_stride / frame_rate, target_dt, atol=1e-6):
-        raise ValueError(f"frame_rate={frame_rate} can not be evenly downsampled to dt={target_dt}")
-    raw_window = (scenario_length - 1) * raw_stride + 1
-    return raw_window, raw_stride
+def compute_waymo_frame_offsets(frame_rate, target_dt=WAYMO_DT, scenario_length=WAYMO_SCENARIO_LENGTH):
+    offsets = [int(round(i * target_dt * frame_rate)) for i in range(scenario_length)]
+    if len(set(offsets)) != len(offsets):
+        raise ValueError(f"frame_rate={frame_rate} is too low to sample unique {scenario_length} steps at dt={target_dt}")
+    return offsets
 
 
 def split_rows_into_waymo_segments(rows, frame_rate, scenario_length=WAYMO_SCENARIO_LENGTH, target_dt=WAYMO_DT):
     if not rows:
         return []
 
-    raw_window, raw_stride = compute_raw_window_and_stride(frame_rate, target_dt=target_dt, scenario_length=scenario_length)
+    frame_offsets = compute_waymo_frame_offsets(frame_rate, target_dt=target_dt, scenario_length=scenario_length)
+    raw_window = frame_offsets[-1] + 1
     min_frame = min(r["frame_number"] for r in rows)
     max_frame = max(r["frame_number"] for r in rows)
 
     segments = []
     start_frame = min_frame
     while start_frame + raw_window - 1 <= max_frame:
-        sampled_frames = [start_frame + i * raw_stride for i in range(scenario_length)]
+        sampled_frames = [start_frame + offset for offset in frame_offsets]
         sampled_set = set(sampled_frames)
         seg_rows = [r for r in rows if r["frame_number"] in sampled_set]
         if seg_rows:
@@ -856,15 +857,94 @@ def save_summary_and_mapping(summary_path, mapping_path, summary, mapping):
         pickle.dump(mapping, f)
 
 
-def write_scenarios_to_directory(scenarios, output_dir, dataset_name, dataset_version):
+def prepare_output_dir(output_dir):
     if os.path.exists(output_dir):
         ans = input(f"Output dir {output_dir} exists. Overwrite? (y/n): ")
         if ans.lower() != "y":
             print("Aborting.")
-            return
+            return False
         shutil.rmtree(output_dir)
 
     os.makedirs(output_dir)
+    return True
+
+
+def write_scenario_file(output_dir, pkl_name, scenario_dict):
+    with open(os.path.join(output_dir, pkl_name), "wb") as pf:
+        pickle.dump(scenario_dict, pf)
+
+
+def find_osm_file_for_location(maps_dir, loc_id):
+    possible_folders = [f for f in os.listdir(maps_dir) if f.startswith(f"{loc_id:02d}_")]
+    if not possible_folders:
+        return None
+    osm_candidate = os.path.join(maps_dir, possible_folders[0], f"location{loc_id}.osm")
+    return osm_candidate if os.path.isfile(osm_candidate) else None
+
+
+def convert_prefix_to_scenarios(prefix, data_dir, maps_dir, dataset_name, dataset_version, segment_size):
+    frame_rate, dt, xUtm, yUtm, loc_id, tracks_meta, agents = read_hetrod_data(prefix, data_dir)
+    rows = process_agents_direct(tracks_meta, agents)
+
+    expected_raw_window = compute_waymo_frame_offsets(frame_rate)[-1] + 1
+    warning = None
+    if segment_size != expected_raw_window:
+        warning = (
+            f"[WARN] [{prefix}] segment_size={segment_size} is ignored for Waymo alignment; "
+            f"using raw_window={expected_raw_window} from frame_rate={frame_rate}"
+        )
+
+    segments = split_rows_into_waymo_segments(rows, frame_rate)
+    if not segments:
+        return {
+            "prefix": prefix,
+            "loc_id": loc_id,
+            "rows": len(rows),
+            "warning": warning,
+            "entries": [],
+        }
+
+    osm_file = find_osm_file_for_location(maps_dir, loc_id)
+    if osm_file is None:
+        raise FileNotFoundError(f"No OSM file found for locationId={loc_id}")
+
+    map_features, map_center = get_osm_map_for_location(loc_id, osm_file, xUtm, yUtm)
+
+    entries = []
+    for i, seg in enumerate(segments, start=1):
+        scenario_id = f"{prefix}_loc{loc_id}_seg{i}"
+        scenario_variants = create_scenario_from_csv(
+            seg["rows"],
+            map_features,
+            map_center,
+            scenario_id,
+            dataset_version,
+            xUtm,
+            yUtm,
+            frame_rate,
+            seg["frames"],
+            f"{prefix}_tracks.csv",
+        )
+        for j, variant in enumerate(scenario_variants, start=1):
+            variant[SD.ID] = f"{scenario_id}_ego_{j}"
+            sc_id = variant[SD.ID]
+            pkl_name = SD.get_export_file_name(dataset_name, dataset_version, sc_id)
+            sc_dict = variant.to_dict()
+            SD.sanity_check(sc_dict)
+            entries.append((pkl_name, sc_dict, sc_dict[SD.METADATA]))
+
+    return {
+        "prefix": prefix,
+        "loc_id": loc_id,
+        "rows": len(rows),
+        "warning": warning,
+        "entries": entries,
+    }
+
+
+def write_scenarios_to_directory(scenarios, output_dir, dataset_name, dataset_version):
+    if not prepare_output_dir(output_dir):
+        return
 
     summary = {}
     mapping = {}
@@ -907,11 +987,18 @@ def main():
         default=None,
         help="Where to put final ScenarioNet PKLs. Default: <root_dir>/converted_scenarios",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(8, (os.cpu_count() or 1))),
+        help="Number of parallel worker processes for prefix-level conversion. Default: min(8, cpu_count).",
+    )
 
     args = parser.parse_args()
     root_dir = args.root_dir
     segment_size = args.segment_size
     output_dir = args.output_dir or os.path.join(root_dir, "converted_scenarios")
+    workers = max(1, args.workers)
 
     data_dir = os.path.join(root_dir, "data")
     maps_dir = os.path.join(root_dir, "maps", "lanelets")
@@ -928,66 +1015,60 @@ def main():
 
     dataset_name = "HetroD"
     dataset_version = "1.0"
-    all_scenarios = []
+    if not prepare_output_dir(output_dir):
+        return
 
-    def find_osm_file_for_location(loc_id):
-        possible_folders = [f for f in os.listdir(maps_dir) if f.startswith(f"{loc_id:02d}_")]
-        if not possible_folders:
-            return None
-        osm_candidate = os.path.join(maps_dir, possible_folders[0], f"location{loc_id}.osm")
-        return osm_candidate if os.path.isfile(osm_candidate) else None
+    summary = {}
+    mapping = {}
+    written_count = 0
+    completed_prefixes = 0
+    summary_path = os.path.join(output_dir, "dataset_summary.pkl")
+    mapping_path = os.path.join(output_dir, "dataset_mapping.pkl")
 
-    for prefix in prefixes:
-        try:
-            frame_rate, dt, xUtm, yUtm, loc_id, tracks_meta, agents = read_hetrod_data(prefix, data_dir)
-        except Exception as e:
-            print(f"[WARN] Skipping prefix {prefix} due to error: {e}")
-            continue
-
-        rows = process_agents_direct(tracks_meta, agents)
-        print(f"[{prefix}] Found {len(rows)} rows, locationId={loc_id}")
-
-        expected_raw_window, _ = compute_raw_window_and_stride(frame_rate)
-        if segment_size != expected_raw_window:
-            print(
-                f"[WARN] segment_size={segment_size} is ignored for Waymo alignment; "
-                f"using raw_window={expected_raw_window} from frame_rate={frame_rate}"
-            )
-
-        segments = split_rows_into_waymo_segments(rows, frame_rate)
-        if not segments:
-            continue
-
-        osm_file = find_osm_file_for_location(loc_id)
-        if osm_file is None:
-            print(f"[WARN] No OSM file found for locationId={loc_id}")
-            continue
-        map_features, map_center = get_osm_map_for_location(loc_id, osm_file, xUtm, yUtm)
-
-        for i, seg in enumerate(segments, start=1):
-            scenario_id = f"{prefix}_loc{loc_id}_seg{i}"
-            scenario_variants = create_scenario_from_csv(
-                seg["rows"],
-                map_features,
-                map_center,
-                scenario_id,
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                convert_prefix_to_scenarios,
+                prefix,
+                data_dir,
+                maps_dir,
+                dataset_name,
                 dataset_version,
-                xUtm,
-                yUtm,
-                frame_rate,
-                seg["frames"],
-                f"{prefix}_tracks.csv",
-            )
-            for j, variant in enumerate(scenario_variants, start=1):
-                variant[SD.ID] = f"{scenario_id}_ego_{j}"
-                all_scenarios.append(variant)
+                segment_size,
+            ): prefix
+            for prefix in prefixes
+        }
 
-    if not all_scenarios:
+        for future in as_completed(futures):
+            prefix = futures[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                print(f"[WARN] Skipping prefix {prefix} due to error: {e}")
+                continue
+
+            completed_prefixes += 1
+            print(f"[{result['prefix']}] Found {result['rows']} rows, locationId={result['loc_id']}")
+            if result["warning"]:
+                print(result["warning"])
+
+            for pkl_name, sc_dict, metadata in result["entries"]:
+                write_scenario_file(output_dir, pkl_name, sc_dict)
+                summary[pkl_name] = metadata
+                mapping[pkl_name] = ""
+                written_count += 1
+
+            save_summary_and_mapping(summary_path, mapping_path, summary, mapping)
+            print(
+                f"[{result['prefix']}] Wrote {len(result['entries'])} scenarios "
+                f"(completed prefixes: {completed_prefixes}/{len(prefixes)}, total pkls: {written_count})"
+            )
+
+    if written_count == 0:
         print("[INFO] No scenarios were produced.")
         return
 
-    write_scenarios_to_directory(all_scenarios, output_dir, dataset_name, dataset_version)
-    print(f"[DONE] Wrote {len(all_scenarios)} scenario PKLs into {output_dir}")
+    print(f"[DONE] Wrote {written_count} scenario PKLs into {output_dir}")
 
 
 if __name__ == "__main__":
