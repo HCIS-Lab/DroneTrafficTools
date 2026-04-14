@@ -155,10 +155,8 @@ The source code in this repository is licensed under the [Apache License 2.0](LI
 The **HetroD dataset** is provided under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)](https://creativecommons.org/licenses/by-nc-sa/4.0/) license for academic and non-commercial research purposes.
 
 ### Commercial Use
-The Non-Commercial (NC) restriction applies to the general public. For commercial licensing inquiries or to discuss internal usage rights for project partners (e.g., fka GmbH), please contact:
-- **[levelXData](https://levelxdata.com/)** 
-- **HCIS Lab, NYCU**
-- 
+The Non-Commercial (NC) restriction applies to the general public. For commercial licensing inquiries or to discuss internal usage rights for project partners (e.g., fka GmbH), please contact: **[levelXData](https://levelxdata.com/)** 
+
 ## Citation
 
 ```bibtex
