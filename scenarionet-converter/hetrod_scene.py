@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os
 import math
 import argparse
@@ -924,12 +923,54 @@ def write_scenario_file(output_dir, pkl_name, scenario_dict):
         pickle.dump(scenario_dict, pf)
 
 
-def find_osm_file_for_location(maps_dir, loc_id):
-    possible_folders = [f for f in os.listdir(maps_dir) if f.startswith(f"{loc_id:02d}_")]
-    if not possible_folders:
+def resolve_data_dir(root_dir, quality_level):
+    data_root = os.path.join(root_dir, "data")
+    if not os.path.isdir(data_root):
         return None
-    osm_candidate = os.path.join(maps_dir, possible_folders[0], f"location{loc_id}.osm")
-    return osm_candidate if os.path.isfile(osm_candidate) else None
+
+    quality_subdirs = {
+        "automated": "01_automated_processing",
+        "final": "02_final",
+    }
+    candidate = os.path.join(data_root, quality_subdirs[quality_level])
+    if os.path.isdir(candidate):
+        return candidate
+
+    # Backward compatibility with the old release where CSVs lived in data/.
+    if any(name.endswith("_tracks.csv") for name in os.listdir(data_root)):
+        return data_root
+    return None
+
+
+def resolve_maps_dir(root_dir):
+    candidates = [
+        os.path.join(root_dir, "maps", "lanelet2"),
+        os.path.join(root_dir, "maps", "lanelets"),
+    ]
+    return next((path for path in candidates if os.path.isdir(path)), None)
+
+
+def find_osm_file_for_location(maps_dir, loc_id):
+    candidates = [
+        # HetroD v1.0+: maps/lanelet2/<location_id>/<location_id>.osm
+        os.path.join(maps_dir, str(loc_id), f"{loc_id}.osm"),
+        # Old release: maps/lanelets/<location_id>_lanelets/location<id>.osm
+        os.path.join(maps_dir, f"{loc_id:02d}_lanelets", f"location{loc_id}.osm"),
+    ]
+    existing = next((path for path in candidates if os.path.isfile(path)), None)
+    if existing is not None:
+        return existing
+
+    possible_folders = sorted(
+        folder
+        for folder in os.listdir(maps_dir)
+        if folder.startswith(f"{loc_id:02d}_")
+    )
+    for folder in possible_folders:
+        candidate = os.path.join(maps_dir, folder, f"location{loc_id}.osm")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def convert_prefix_to_scenarios(prefix, data_dir, maps_dir, dataset_name, dataset_version, segment_size):
@@ -1024,7 +1065,17 @@ def main():
     parser.add_argument(
         "--root_dir",
         required=True,
-        help="Path to HetroD-dataset-v1.1 root, which should contain 'data/' & 'maps/' subfolders.",
+        help="Path to a HetroD dataset root containing data/ and maps/.",
+    )
+    parser.add_argument(
+        "--quality_level",
+        choices=("automated", "final"),
+        default="automated",
+        help=(
+            "HetroD v1.0 data quality level. 'automated' uses the complete "
+            "01_automated_processing set; 'final' uses 02_final, which may contain "
+            "only a subset of recordings. Ignored for old flat data/ releases."
+        ),
     )
     parser.add_argument(
         "--segment_size",
@@ -1050,17 +1101,27 @@ def main():
     output_dir = args.output_dir or os.path.join(root_dir, "converted_scenarios")
     workers = max(1, args.workers)
 
-    data_dir = os.path.join(root_dir, "data")
-    maps_dir = os.path.join(root_dir, "maps", "lanelets")
-    if not os.path.isdir(data_dir):
-        print(f"[ERROR] No 'data' subfolder found in {root_dir}")
+    data_dir = resolve_data_dir(root_dir, args.quality_level)
+    maps_dir = resolve_maps_dir(root_dir)
+    if data_dir is None:
+        print(
+            f"[ERROR] No HetroD CSV directory found for quality level "
+            f"'{args.quality_level}' under {root_dir}"
+        )
         return
-    if not os.path.isdir(maps_dir):
-        print(f"[ERROR] No 'maps/lanelets' folder found in {root_dir}")
+    if maps_dir is None:
+        print(f"[ERROR] No maps/lanelet2 or maps/lanelets folder found in {root_dir}")
         return
 
     prefixes = sorted(
         set(fname.replace("_tracks.csv", "") for fname in os.listdir(data_dir) if fname.endswith("_tracks.csv"))
+    )
+    if not prefixes:
+        print(f"[ERROR] No *_tracks.csv recordings found in {data_dir}")
+        return
+    print(
+        f"[INFO] Using data directory: {data_dir} ({len(prefixes)} recordings), "
+        f"maps directory: {maps_dir}"
     )
 
     dataset_name = "HetroD"

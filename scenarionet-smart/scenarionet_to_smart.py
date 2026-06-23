@@ -2,8 +2,10 @@
 
 import argparse
 import hashlib
+import os
 import pickle
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,9 +15,36 @@ import numpy as np
 import torch
 from scipy.interpolate import interp1d
 
-CATK_ROOT = Path("/home/hcis-s26/Yuhsiang/catk")
-if CATK_ROOT.exists():
-    sys.path.insert(0, CATK_ROOT.as_posix())
+# NumPy 2 pickles refer to numpy._core, while older CATK environments may
+# still use NumPy 1.x where the same modules live under numpy.core.
+if not hasattr(np, "_core"):
+    import numpy.core
+    import numpy.core.multiarray
+    import numpy.core.numeric
+
+    sys.modules.setdefault("numpy._core", numpy.core)
+    sys.modules.setdefault("numpy._core.multiarray", numpy.core.multiarray)
+    sys.modules.setdefault("numpy._core.numeric", numpy.core.numeric)
+
+CATK_ROOT_CANDIDATES = [
+    Path(os.environ["CATK_ROOT"]).expanduser() if os.environ.get("CATK_ROOT") else None,
+    Path.cwd(),
+    Path("/media/user/data1/yuhsiang/catk"),
+    Path("/home/hcis-s26/Yuhsiang/catk"),
+]
+CATK_ROOT = next(
+    (
+        path.resolve()
+        for path in CATK_ROOT_CANDIDATES
+        if path is not None and (path / "src" / "smart").is_dir()
+    ),
+    None,
+)
+if CATK_ROOT is None:
+    raise ImportError(
+        "Could not locate CATK. Set CATK_ROOT to a checkout containing src/smart."
+    )
+sys.path.insert(0, CATK_ROOT.as_posix())
 
 from src.smart.utils.preprocess import get_polylines_from_polygon, preprocess_map  # noqa: E402
 
@@ -83,8 +112,6 @@ DOUBLE_ROAD_LINE_STITCH_ENDPOINT_DISTANCE_THRESHOLD = 2.25
 DOUBLE_ROAD_LINE_STITCH_ANGLE_THRESHOLD_DEG = 20.0
 DOUBLE_ROAD_LINE_STITCH_WINDOW_DISTANCE_THRESHOLD = 1.0
 ROAD_LINE_STITCH_HEADING_WINDOW = 4
-
-
 def stable_int_id(raw_id: Any) -> int:
     try:
         return int(raw_id)
@@ -789,14 +816,123 @@ def convert_scenario(
     )
     map_dict["scenario_id"] = scenario["id"]
 
-    with open(output_path, "wb") as f:
-        pickle.dump(map_dict, f)
+    validate_smart_cache(map_dict, scenario_id=str(scenario["id"]), num_steps=num_steps)
+
+    temporary_path = output_path.with_suffix(
+        f"{output_path.suffix}.{os.getpid()}.tmp"
+    )
+    try:
+        with open(temporary_path, "wb") as f:
+            pickle.dump(map_dict, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
     return scenario["id"], int(map_dict["agent"]["num_nodes"])
 
 
+def validate_smart_cache(
+    data: Dict[str, Any],
+    scenario_id: str,
+    num_steps: int,
+) -> None:
+    if data.get("scenario_id") != scenario_id:
+        raise ValueError(
+            f"scenario_id mismatch: expected {scenario_id}, got {data.get('scenario_id')}"
+        )
+
+    map_save = data["map_save"]
+    point_token = data["pt_token"]
+    agent = data["agent"]
+
+    traj_pos = map_save["traj_pos"]
+    traj_theta = map_save["traj_theta"]
+    point_type = point_token["type"]
+    polygon_type = point_token["pl_type"]
+    map_nodes = int(point_token["num_nodes"])
+    if traj_pos.ndim != 3 or tuple(traj_pos.shape[1:]) != (3, 2):
+        raise ValueError(f"invalid map traj_pos shape: {tuple(traj_pos.shape)}")
+    if not (
+        traj_pos.shape[0]
+        == traj_theta.shape[0]
+        == point_type.shape[0]
+        == polygon_type.shape[0]
+        == map_nodes
+    ):
+        raise ValueError("map tensor lengths do not match pt_token.num_nodes")
+    if not torch.isfinite(traj_pos).all() or not torch.isfinite(traj_theta).all():
+        raise ValueError("map tensors contain non-finite values")
+
+    num_agents = int(agent["num_nodes"])
+    expected_shapes = {
+        "valid_mask": (num_agents, num_steps),
+        "role": (num_agents, 3),
+        "id": (num_agents,),
+        "type": (num_agents,),
+        "position": (num_agents, num_steps, 3),
+        "heading": (num_agents, num_steps),
+        "velocity": (num_agents, num_steps, 2),
+        "shape": (num_agents, 3),
+    }
+    for key, expected_shape in expected_shapes.items():
+        actual_shape = tuple(agent[key].shape)
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"invalid agent.{key} shape: expected {expected_shape}, got {actual_shape}"
+            )
+    for key in ("position", "heading", "velocity", "shape"):
+        if not torch.isfinite(agent[key]).all():
+            raise ValueError(f"agent.{key} contains non-finite values")
+
+
 def list_scenario_files(input_dir: Path) -> List[Path]:
     return sorted(p for p in input_dir.glob("*.pkl") if p.name not in SKIP_FILENAMES)
+
+
+def convert_scenario_file(
+    input_path: Path,
+    output_dir: Path,
+    prune_crosswalk_box_broken_roadline: bool,
+    crosswalk_box_margin: float,
+) -> Tuple[str, str, int]:
+    with open(input_path, "rb") as f:
+        scenario = pickle.load(f)
+    output_path = output_dir / f"{scenario['id']}.pkl"
+    scenario_id, num_agents = convert_scenario(
+        scenario,
+        output_path,
+        prune_crosswalk_box_broken_roadline=prune_crosswalk_box_broken_roadline,
+        crosswalk_box_margin=crosswalk_box_margin,
+    )
+    return input_path.name, scenario_id, num_agents
+
+
+def scenario_id_from_input_path(input_path: Path) -> Optional[str]:
+    parts = input_path.stem.split("_", 3)
+    if len(parts) != 4 or parts[0] != "sd":
+        return None
+    return parts[3]
+
+
+def configure_worker() -> None:
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
+def expected_output_path(input_path: Path, output_dir: Path) -> Optional[Path]:
+    # ScenarioNet export names follow sd_<dataset>_<version>_<scenario_id>.pkl.
+    scenario_id = scenario_id_from_input_path(input_path)
+    if scenario_id is None:
+        return None
+    return output_dir / f"{scenario_id}.pkl"
 
 
 def main():
@@ -804,6 +940,17 @@ def main():
     parser.add_argument("--input_dir", required=True, help="ScenarioNet directory containing scenario PKLs.")
     parser.add_argument("--output_dir", required=True, help="Output SMART cache split directory, e.g. cache/SMART/validation.")
     parser.add_argument("--limit", type=int, default=None, help="Optional number of files to convert for quick testing.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(16, os.cpu_count() or 1)),
+        help="Number of parallel conversion processes. Default: min(16, cpu_count).",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Reconvert scenarios whose output pickle already exists.",
+    )
     parser.add_argument(
         "--prune_crosswalk_box_broken_roadline",
         action="store_true",
@@ -819,30 +966,59 @@ def main():
     files = list_scenario_files(input_dir)
     if args.limit is not None:
         files = files[: args.limit]
+    if not args.overwrite:
+        original_count = len(files)
+        files = [
+            path
+            for path in files
+            if (
+                expected_output_path(path, output_dir) is None
+                or not expected_output_path(path, output_dir).is_file()
+            )
+        ]
+        skipped = original_count - len(files)
+        if skipped:
+            print(f"[INFO] Resuming: skipped {skipped} existing output files.")
 
     if not files:
         print("[INFO] No ScenarioNet PKLs found.")
         return
 
     converted = 0
-    for path in files:
-        try:
-            with open(path, "rb") as f:
-                scenario = pickle.load(f)
-            out_path = output_dir / f"{scenario['id']}.pkl"
-            scenario_id, num_agents = convert_scenario(
-                scenario,
-                out_path,
-                prune_crosswalk_box_broken_roadline=args.prune_crosswalk_box_broken_roadline,
-                crosswalk_box_margin=args.crosswalk_box_margin,
+    failed = 0
+    workers = max(1, args.workers)
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=configure_worker,
+    ) as executor:
+        futures = {
+            executor.submit(
+                convert_scenario_file,
+                path,
+                output_dir,
+                args.prune_crosswalk_box_broken_roadline,
+                args.crosswalk_box_margin,
+            ): path
+            for path in files
+        }
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                _, scenario_id, num_agents = future.result()
+            except Exception as e:
+                failed += 1
+                print(f"[WARN] Failed to convert {path.name}: {e}")
+                continue
+            converted += 1
+            print(
+                f"[OK] {scenario_id} -> {scenario_id}.pkl "
+                f"(agents={num_agents}, progress={converted + failed}/{len(files)})"
             )
-        except Exception as e:
-            print(f"[WARN] Failed to convert {path.name}: {e}")
-            continue
-        converted += 1
-        print(f"[OK] {scenario_id} -> {out_path.name} (agents={num_agents})")
 
-    print(f"[DONE] Converted {converted} scenarios into {output_dir}")
+    print(
+        f"[DONE] Converted {converted}/{len(files)} scenarios into {output_dir} "
+        f"(failed={failed}, workers={workers})"
+    )
 
 
 if __name__ == "__main__":

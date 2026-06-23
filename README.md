@@ -69,9 +69,16 @@ Convert `HetroD` to `ScenarioNet`:
 
 ```bash
 python scenarionet-converter/hetrod_scene.py \
-  --root_dir /path/to/HetroD-dataset-v1.1 \
+  --root_dir /path/to/hetroD-dataset-v1.0 \
+  --quality_level automated \
   --output_dir /path/to/output
 ```
+
+HetroD v1.0 stores the complete automatically processed recordings in
+`data/01_automated_processing` and the currently available manually checked
+subset in `data/02_final`. Use `--quality_level final` to convert only the
+final-quality subset. The converter also remains compatible with the old flat
+`data/` and `maps/lanelets/` layout.
 
 Convert `inD` to `ScenarioNet`:
 
