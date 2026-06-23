@@ -309,20 +309,16 @@ def parse_osm_map(osm_file, xUtmOrigin, yUtmOrigin):
                 if m["type"] == "way" and m["role"] in ["left", "right"]:
                     lanelet_ways.add(m["ref"])
 
-    map_features = {}
-    for way_id in lanelet_ways:
-        if way_id not in ways:
-            continue
-        wdata = ways[way_id]
+    def build_feature_from_way(way_id, wdata):
         osm_type = wdata["tags"].get("type", "line_thin")
         subtype = wdata["tags"].get("subtype", "solid")
         md_type = map_osm_to_md_type(osm_type, subtype)
         if not md_type:
-            continue
+            return None
 
         coords = [nodes[ref] for ref in wdata["nd_refs"] if ref in nodes]
         if not coords:
-            continue
+            return None
 
         coords_array = np.array(coords, dtype=np.float32)
         if md_type == MetaDriveType.CROSSWALK:
@@ -348,10 +344,64 @@ def parse_osm_map(osm_file, xUtmOrigin, yUtmOrigin):
                 coords_array = coords_array[:, :2]
                 if len(coords_array) > 2 and not np.array_equal(coords_array[0], coords_array[-1]):
                     coords_array = np.vstack([coords_array, coords_array[0:1]])
-            feature = {"type": md_type, "polygon": coords_array}
-        else:
-            feature = {"type": md_type, "polyline": coords_array}
-        map_features[way_id] = feature
+            return {"type": md_type, "polygon": coords_array}
+
+        return {"type": md_type, "polyline": coords_array}
+
+    map_features = {}
+    for way_id in lanelet_ways:
+        if way_id not in ways:
+            continue
+        feature = build_feature_from_way(way_id, ways[way_id])
+        if feature is not None:
+            map_features[way_id] = feature
+
+    # Also keep physical outer boundaries that only appear as multipolygon outers.
+    # In HetroD these often encode walls / curbstones / fences that visually enclose the road,
+    # but they are missed if we only preserve lanelet left/right members.
+    boundary_outer_way_ids = set()
+    for rel in relations:
+        if rel["tags"].get("type") != "multipolygon":
+            continue
+        for m in rel["members"]:
+            if m["type"] != "way" or m.get("role") != "outer":
+                continue
+            way_id = m["ref"]
+            if way_id not in ways:
+                continue
+            osm_type = ways[way_id]["tags"].get("type")
+            if osm_type in {"wall", "curbstone", "fence", "road_border"}:
+                boundary_outer_way_ids.add(way_id)
+
+    for way_id in sorted(boundary_outer_way_ids):
+        if way_id in map_features:
+            continue
+        feature = build_feature_from_way(way_id, ways[way_id])
+        if feature is not None:
+            map_features[way_id] = feature
+
+    # Also keep standalone boundary-like ways that are not referenced by any relation.
+    # This captures isolated walls / curbstones / fences that still visually define drivable space.
+    relation_way_ids = set()
+    for rel in relations:
+        for m in rel["members"]:
+            if m["type"] == "way":
+                relation_way_ids.add(m["ref"])
+
+    standalone_boundary_way_ids = set()
+    for way_id, wdata in ways.items():
+        if way_id in relation_way_ids:
+            continue
+        osm_type = wdata["tags"].get("type")
+        if osm_type in {"wall", "curbstone", "fence", "road_border"}:
+            standalone_boundary_way_ids.add(way_id)
+
+    for way_id in sorted(standalone_boundary_way_ids):
+        if way_id in map_features:
+            continue
+        feature = build_feature_from_way(way_id, ways[way_id])
+        if feature is not None:
+            map_features[way_id] = feature
 
     lane_boundary_refs = {}
     for rel in relations:

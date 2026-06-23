@@ -53,6 +53,7 @@ preprocessed/
 train/
 val/
 test/
+scenarionet-smart/debug/
 
 # Logs
 *.log
